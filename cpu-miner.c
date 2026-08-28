@@ -1839,6 +1839,23 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		if (opt_showdiff || opt_max_diff > 0.)
 			calc_network_diff(work);
 
+		/* Detect BIP-110 V2 header (bit 31 of version) */
+		work->is_v2 = (work->data[0] & BIP110_VERSION_V2_FLAG) != 0;
+		if (work->is_v2 && opt_algo == ALGO_BLAKE2B) {
+			memset(&work->v2_hdr, 0, sizeof(work->v2_hdr));
+			work->v2_hdr.version = work->data[0];
+			for (i = 0; i < 8; i++)
+				memcpy(work->v2_hdr.hashPrevBlock + i * 4, &work->data[1 + i], 4);
+			for (i = 0; i < 8; i++)
+				memcpy(work->v2_hdr.hashMerkleRoot + i * 4, &work->data[9 + i], 4);
+			work->v2_hdr.time_on_wire = work->data[17];
+			work->v2_hdr.nBits = work->data[18];
+			work->v2_hdr.nNonce = work->data[19];
+			work->v2_hdr.m_height = sctx->bloc_height;
+			work->v2_hdr.m_flags = BIP110_ASIC_PROFILE_0 | BIP110_FLAG_USE_TIME_OFFSET;
+			applog(LOG_INFO, "BIP-110 V2 header detected, using three-stage BLAKE2b");
+		}
+
 		if (opt_algo == ALGO_DROP || opt_algo == ALGO_NEOSCRYPT || opt_algo == ALGO_ZR5) {
 			/* reversed endian */
 			for (i = 0; i <= 18; i++)
@@ -2117,8 +2134,12 @@ static void *miner_thread(void *userdata)
 			*nonceptr = 0xffffffffU / opt_n_threads * thr_id;
 			if (opt_randomize)
 				nonceptr[0] += ((rand()*4) & UINT32_MAX) / opt_n_threads;
-		} else
+		} else {
 			++(*nonceptr);
+			/* keep V2 header nonce in sync with the rolling nonce pointer */
+			if (work.is_v2 && opt_algo == ALGO_BLAKE2B)
+				work.v2_hdr.nNonce = *nonceptr;
+		}
 		pthread_mutex_unlock(&g_work_lock);
 		work_restart[thr_id].restart = 0;
 
@@ -2297,7 +2318,10 @@ static void *miner_thread(void *userdata)
 			rc = scanhash_blakecoin(thr_id, &work, max_nonce, &hashes_done);
 			break;
 		case ALGO_BLAKE2B:
-			rc = scanhash_blake2b(thr_id, &work, max_nonce, &hashes_done);
+			if (work.is_v2)
+				rc = scanhash_blake2b_v2(thr_id, &work, max_nonce, &hashes_done);
+			else
+				rc = scanhash_blake2b(thr_id, &work, max_nonce, &hashes_done);
 			break;
 		case ALGO_BLAKE2S:
 			rc = scanhash_blake2s(thr_id, &work, max_nonce, &hashes_done);

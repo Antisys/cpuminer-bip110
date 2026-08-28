@@ -40,17 +40,9 @@
 #define ROTR64(x, y)  (((x) >> (y)) ^ ((x) << (64 - (y))))
 #endif
 
-// Little-endian byte access.
-
-#define B2B_GET64(p)                            \
-	(((uint64_t) ((uint8_t *) (p))[0]) ^        \
-	(((uint64_t) ((uint8_t *) (p))[1]) << 8) ^  \
-	(((uint64_t) ((uint8_t *) (p))[2]) << 16) ^ \
-	(((uint64_t) ((uint8_t *) (p))[3]) << 24) ^ \
-	(((uint64_t) ((uint8_t *) (p))[4]) << 32) ^ \
-	(((uint64_t) ((uint8_t *) (p))[5]) << 40) ^ \
-	(((uint64_t) ((uint8_t *) (p))[6]) << 48) ^ \
-	(((uint64_t) ((uint8_t *) (p))[7]) << 56))
+// Little-endian 64-bit load. memcpy avoids alignment traps and the compiler
+// lowers it to a single mov on little-endian targets (-march=native).
+#define B2B_GET64(p) (*(const uint64_t *)(const void *)(p))
 
 // G Mixing function.
 
@@ -158,17 +150,42 @@ int blake2b_init(blake2b_ctx *ctx, size_t outlen,
 void blake2b_update(blake2b_ctx *ctx,
 	const void *in, size_t inlen)       // data bytes
 {
-	size_t i;
+	const uint8_t *src = (const uint8_t *) in;
 
-	for (i = 0; i < inlen; i++) {
-		if (ctx->c == 128) {            // buffer full ?
-			ctx->t[0] += ctx->c;        // add counters
-			if (ctx->t[0] < ctx->c)     // carry overflow ?
-				ctx->t[1]++;            // high word
-			blake2b_compress(ctx, 0);   // compress (not last)
-			ctx->c = 0;                 // counter to zero
+	if (ctx->c == 128) {                // buffer full ?
+		ctx->t[0] += 128;
+		if (ctx->t[0] < 128)
+			ctx->t[1]++;
+		blake2b_compress(ctx, 0);       // compress (not last)
+		ctx->c = 0;
+	}
+
+	while (inlen > 0) {
+		size_t space = 128 - ctx->c;
+		if (inlen >= space && space == 128) {
+			// Fast path: full block, hash directly from input buffer
+			memcpy(ctx->b, src, 128);
+			ctx->t[0] += 128;
+			if (ctx->t[0] < 128)
+				ctx->t[1]++;
+			blake2b_compress(ctx, 0);
+			ctx->c = 0;
+			src += 128;
+			inlen -= 128;
+		} else {
+			size_t n = inlen < space ? inlen : space;
+			memcpy(ctx->b + ctx->c, src, n);
+			ctx->c += n;
+			src += n;
+			inlen -= n;
+			if (ctx->c == 128) {
+				ctx->t[0] += 128;
+				if (ctx->t[0] < 128)
+					ctx->t[1]++;
+				blake2b_compress(ctx, 0);
+				ctx->c = 0;
+			}
 		}
-		ctx->b[ctx->c++] = ((const uint8_t *) in)[i];
 	}
 }
 

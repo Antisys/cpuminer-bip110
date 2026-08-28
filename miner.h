@@ -399,6 +399,64 @@ void cpu_getname(char *outbuf, size_t maxsz);
 void cpu_getmodelid(char *outbuf, size_t maxsz);
 float cpu_temp(int core);
 
+// ============================================================================
+// BIP-110 / BLAKE2b Block Header V2 (164 bytes)
+// ============================================================================
+
+#define BIP110_VERSION_V2_FLAG     0x80000000u
+#define BIP110_HEADER_V2_SIZE      164
+#define BIP110_HEADER_V1_SIZE      80
+
+#define BIP110_FLAG_ASIC_PROFILE_MASK   0x03u
+#define BIP110_FLAG_USE_TIME_OFFSET     0x04u
+
+#define BIP110_ASIC_PROFILE_0  0
+#define BIP110_ASIC_PROFILE_1  1
+#define BIP110_ASIC_PROFILE_2  2
+#define BIP110_ASIC_PROFILE_3  3
+
+#pragma pack(push, 1)
+struct block_header_v2 {
+    uint32_t version;
+    uint8_t  hashPrevBlock[32];
+    uint8_t  hashMerkleRoot[32];
+    uint32_t time_on_wire;
+    uint32_t nBits;
+    uint32_t nNonce;
+    uint32_t m_nonce2;
+    uint32_t m_nonce3;
+    uint8_t  m_extranonce[16];
+    uint32_t m_time_offset;
+    uint16_t m_txcount;
+    uint8_t  m_flags;
+    uint8_t  m_xor_key_mask_clear_bits;
+    uint8_t  m_xor_key[16];
+    uint32_t m_height;
+    uint8_t  m_mm_rhs[32];
+};
+#pragma pack(pop)
+
+void tagged_hash(const char *tag, const uint8_t *data, size_t len, uint8_t *out);
+void bip110_compute_h1(const struct block_header_v2 *hdr, uint8_t *h1_hash);
+void bip110_compute_h2(const uint8_t *h1_hash, const uint8_t *mm_rhs, uint8_t *h2_hash);
+void bip110_compute_hash1(const uint8_t *h2_hash, const uint8_t *extranonce,
+                          uint8_t *hash1);
+void bip110_compute_prevblock_hidden(const uint8_t *prevblock, uint8_t *hidden);
+void bip110_compute_pow_hash_pre(const struct block_header_v2 *hdr,
+                                 const uint8_t *h2_hash,
+                                 const uint8_t *hash1,
+                                 const uint8_t *prevblock_hidden,
+                                 uint8_t *final_hash);
+void bip110_compute_pow_hash(const struct block_header_v2 *hdr, const uint8_t *h2_hash,
+                              uint8_t *final_hash);
+void bip110_apply_xor_mask(const uint8_t *hash2, const uint8_t *xor_key,
+                            uint8_t clear_bits, uint8_t *final_hash);
+int  bip110_create_header(const uint8_t *prevhash, const uint8_t *merkle_root,
+                           uint32_t time, uint32_t nbits, uint32_t height,
+                           uint32_t txcount, struct block_header_v2 *hdr);
+int  scanhash_blake2b_v2(int thr_id, struct work *work, uint32_t max_nonce,
+                          uint64_t *hashes_done);
+
 struct work {
 	uint32_t data[48];
 	uint32_t target[8];
@@ -415,6 +473,10 @@ struct work {
 	char *job_id;
 	size_t xnonce2_len;
 	unsigned char *xnonce2;
+
+	// BIP-110 V2 header (set when version & 0x80000000)
+	int is_v2;
+	struct block_header_v2 v2_hdr;
 };
 
 struct stratum_job {
@@ -569,6 +631,5 @@ void yescrypt_hash_r8(const char* input, char* output, uint32_t len);
 void yescrypt_hash_r16(const char* input, char* output, uint32_t len);
 void yescrypt_hash_r32(const char* input, char* output, uint32_t len);
 void zr5hash_pok(void *output, uint32_t *pdata);
-
 
 #endif /* __MINER_H__ */

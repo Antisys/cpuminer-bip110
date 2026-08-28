@@ -6,6 +6,140 @@ CPUMiner-Multi
 This is a multi-threaded CPU miner,
 fork of [pooler](//github.com/pooler)'s cpuminer (see AUTHORS for list of contributors).
 
+## BIP-110 BLAKE2b V2 Miner (v0.1-bip110)
+
+A CPU miner for the BIP-110 BLAKE2b proof-of-work hard fork (Bitcoin Knots
+[PR #359](https://github.com/bitcoinknots/bitcoin/pull/359), luke-jr's
+`pow_hf_blake2b` branch).
+
+The miner connects to a **DATUM Gateway** over Stratum v1. The gateway does
+*not* act as a pool: it fetches block templates from the local Bitcoin Knots
+node and only distributes the work to miners.
+
+```
+Local Bitcoin Knots node  <--RPC-->  DATUM Gateway  <--Stratum v1-->  cpuminer
+  (block templates)                   (work distribution)             (BLAKE2b PoW)
+```
+
+### BIP-110 V2 header
+
+The V2 header (164 bytes) is a three-stage BLAKE2b-256 hash:
+
+1. `h1` = TaggedHash("Bitcoin block header 1") over the header-1 fields
+   (prevblock, height, merkle root, time-on-wire, nbits, txcount, flags,
+   xor-key hash) — **SHA256-based TaggedHash** (BIP-340 style), not BLAKE2b.
+2. `h2` = TaggedHash("Merge-mining hook") over `h1 || zeros || mm_rhs`.
+3. Final PoW = BLAKE2b-256 over a profile-dependent ASIC input (4 profiles),
+   with an optional XOR mask applied to the result.
+
+All header fields are serialized in internal (little-endian) byte order, as
+in Bitcoin's `uint256`/`uint128` serialization. The implementation is verified
+against the official test vectors in PR #359 (`test_bip110_vectors.c`, all
+checks pass).
+
+> **Warning:** PR #359 is still a **Draft**. The header structure may change.
+> BIP-110 V2 is not yet active on the testnet, so the miner currently runs in
+> V1 BLAKE2b mode until the fork activates on the node.
+
+### Dependencies
+
+Ubuntu/Debian:
+
+```bash
+sudo apt install build-essential autoconf automake libtool pkg-config \
+    libssl-dev libcurl4-openssl-dev libjansson-dev libsodium-dev zlib1g-dev
+```
+
+Runtime: a local [Bitcoin Knots](https://bitcoinknots.org/) node and the
+[DATUM Gateway](https://github.com/bitcoinknots/datum_gateway).
+
+### Installation
+
+```bash
+cd cpuminer-multi
+./build.sh          # builds the miner and runs the self-tests
+./cpuminer --help   # verify the binary
+```
+
+The build script applies `-O3 -march=native -mtune=native`, corrects the
+`LIBS` line if the autotools configuration misses libraries, and runs the
+BIP-110 vector tests + BLAKE2b unit tests.
+
+### Configuration
+
+#### Bitcoin Knots (`~/.bitcoin/bitcoin.conf`)
+
+```ini
+testnet=1
+server=1
+dbcache=1000
+maxconnections=20
+rpcuser=bitcoin
+rpcpassword=bitcoinrpc
+```
+
+Start: `bitcoind -daemon` (wait until `getblockchaininfo` reports
+`initialblockdownload: false`).
+
+#### DATUM Gateway (`datum_gateway_config.json`)
+
+```json
+{
+    "bitcoind": { "rpcuser": "bitcoin", "rpcpassword": "bitcoinrpc",
+                  "rpcurl": "http://127.0.0.1:18332" },
+    "stratum":  { "listen_port": 23334 },
+    "api":      { "admin_password": "test1234", "listen_port": 7152 }
+}
+```
+
+Start: `./datum_gateway -c datum_gateway_config.json`
+
+### Usage
+
+Benchmark (no network needed):
+
+```bash
+./cpuminer --benchmark -a blake2b -t 8
+```
+
+Mine against the local gateway:
+
+```bash
+./cpuminer -a blake2b -o stratum+tcp://127.0.0.1:23334 -u <user> -p x -t 8
+```
+
+When the node sends V2 templates (version bit 31 set), the miner
+automatically switches to the three-stage BLAKE2b V2 path
+(`scanhash_blake2b_v2`) and logs `BIP-110 V2 header detected`.
+
+### Performance
+
+Optimizations applied (Schritt 8):
+
+* `-O3 -march=native -mtune=native` (compiler auto-vectorizes with SSE/xmm)
+* nonce-independent values (`h1`, `h2`, `hash1`, `prevblock_hidden`)
+  precomputed once per job instead of per hash
+* block-wise `blake2b_update` and 64-bit loads in `crypto/blake2b.c`
+* per-thread nonce ranges + nonce rolling (V2 nonce kept in sync)
+
+Measured on an Intel i5-8365U (4C/8T):
+
+| path              | before    | after     |
+|-------------------|-----------|-----------|
+| V2 single-thread  | 245 kH/s  | 1673 kH/s |
+| V2 8 threads (60s)| ~2 MH/s   | 9.1 MH/s  |
+
+### Tests
+
+```bash
+# BIP-110 vectors (official PR #359 vectors, must all pass)
+./build.sh
+
+# manual
+gcc -O3 -march=native -o /tmp/test_bip110_vectors test_bip110_vectors.c \
+    crypto/blake2b.c crypto/blake2b_v2.c -I. -lssl -lcrypto && /tmp/test_bip110_vectors
+```
+
 #### Table of contents
 
 * [Algorithms](#algorithms)
