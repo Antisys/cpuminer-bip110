@@ -13,6 +13,8 @@
 #include <string.h>
 #include <stdint.h>
 
+void blake2b_hash(void *output, const void *input);
+
 #define V2_NONCE3_STEP  1        // L4 nonce increment
 #define V2_NONCE3_MAX   0x100u   // 8-bit space (256 values)
 
@@ -30,6 +32,59 @@ static int v2_fulltest(const uint8_t *hash, const uint32_t *ptarget)
             return 0;
     }
     return 1; // equal
+}
+
+/*
+ * BIP-110 BLAKE2b Sia-style scan (DATUM gateway, header-v2 jobs).
+ *
+ * work->data holds an 80-byte work header:
+ *   [0:32]  prevblock_hidden
+ *   [32:40] nonce8  (nNonce + m_nonce2)  <- scanned here
+ *   [40:48] ntime8  (time_offset + nonce3, from gateway)
+ *   [48:80] root    (hash1 = blake2b(0x00||coinb1||extranonce))
+ *
+ * block_hash = blake2b(work80) XOR xor_mask  (xor_key is null -> mask = 0)
+ */
+int scanhash_blake2b_sia(int thr_id, struct work *work, uint32_t max_nonce,
+                         uint64_t *hashes_done)
+{
+    uint32_t vhashcpu[8];
+    uint8_t *pdata = (uint8_t*)work->data;
+    uint32_t *ptarget = work->target;
+
+    /* Self-managed per-thread nonce range: [start, end).
+     * data[8..9] carries the rolling nonce; re-init at range start. */
+    const uint64_t range = 0xffffffffULL / opt_n_threads;
+    const uint64_t start = range * thr_id;
+    const uint64_t end = (thr_id == opt_n_threads - 1)
+        ? 0xffffffffULL : range * (thr_id + 1) - 0x20;
+
+    uint64_t n = (uint64_t)work->data[8] | ((uint64_t)work->data[9] << 32);
+    if (n < start || n >= end)
+        n = start;
+
+    do {
+        uint32_t nlo = (uint32_t)n;
+        uint32_t nhi = (uint32_t)(n >> 32);
+        memcpy(pdata + 32, &nlo, 4);
+        memcpy(pdata + 36, &nhi, 4);
+
+        blake2b_hash(vhashcpu, pdata);
+
+        if (v2_fulltest((uint8_t*)vhashcpu, ptarget)) {
+            work_set_target_ratio(work, vhashcpu);
+            *hashes_done = n - start + 1;
+            work->data[8] = nlo;
+            work->data[9] = nhi;
+            return 1;
+        }
+        n++;
+    } while (n < end && !work_restart[thr_id].restart);
+
+    *hashes_done = n - start + 1;
+    work->data[8] = (uint32_t)n;
+    work->data[9] = (uint32_t)(n >> 32);
+    return 0;
 }
 
 int scanhash_blake2b_v2(int thr_id, struct work *work, uint32_t max_nonce,

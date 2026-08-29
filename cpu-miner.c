@@ -46,6 +46,7 @@
 #endif
 
 #include "miner.h"
+#include "crypto/blake2b.h"
 
 #ifdef WIN32
 #include "compat/winansi.h"
@@ -1207,10 +1208,24 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 			} else {
 				xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
 			}
+
+			if (opt_algo == ALGO_BLAKE2B && work->is_sia_blake2b) {
+				/* BIP-110 Sia-style submit: [worker, job, extranonce2(8),
+				 * ntime8(8), nonce8(8)] */
+				char ntime8str[17], nonce8str[17];
+				bin2hex(ntime8str, (const unsigned char*)&work->data[10], 8);
+				bin2hex(nonce8str, (const unsigned char*)&work->data[8], 8);
+				xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
+				snprintf(s, JSON_BUF_LEN,
+						"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
+						rpc_user, work->job_id, xnonce2str, ntime8str, nonce8str);
+				free(xnonce2str);
+			} else {
 			snprintf(s, JSON_BUF_LEN,
 					"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
 					rpc_user, work->job_id, xnonce2str, ntimestr, noncestr);
 			free(xnonce2str);
+		}
 		}
 
 		// store to keep/display solved blocs (work struct not linked on accept notification)
@@ -1828,6 +1843,39 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 			for (i = 0; i < 8; i++) // prevhash
 				work->data[12+i] = ((uint32_t*)merkle_root)[i];
 			//applog_hex(&work->data[0], 80);
+		} else if (opt_algo == ALGO_BLAKE2B && sctx->job.blake2b) {
+			/* BIP-110 BLAKE2b Sia-style work (DATUM gateway).
+			 * work80 = prevblock_hidden(32) + nonce8(8) + ntime8(8) + root(32)
+			 * root   = blake2b(0x00 || coinb1(39) || extranonce(12))
+			 * hash   = blake2b(work80) XOR xor_mask
+			 */
+			uint8_t prevblock_hidden[32], root[32];
+			uint8_t extranonce[12] = {0};
+			int en = (int)sctx->xnonce1_size;
+			if (en > 4) en = 4;
+			memcpy(extranonce, sctx->xnonce1, en);
+			memcpy(extranonce + 4, work->xnonce2, 8);
+			bip110_compute_prevblock_hidden(sctx->job.prevhash, prevblock_hidden);
+			{
+				uint8_t leaf[52];
+				memset(leaf, 0, sizeof(leaf));
+				leaf[0] = 0;
+				memcpy(leaf + 1, sctx->job.blake2b_coinb1, 39);
+				memcpy(leaf + 40, extranonce, 12);
+				blake2b_ctx bctx;
+				blake2b_init(&bctx, 32, NULL, 0);
+				blake2b_update(&bctx, leaf, sizeof(leaf));
+				blake2b_final(&bctx, root);
+			}
+			memcpy(work->data, prevblock_hidden, 32);
+			/* nonce8 (data[8..9]) left to the thread loop to manage;
+			 * stratum_gen_work must NOT reset it on regen, or all
+			 * threads re-scan the same range. */
+			memcpy(&work->data[10], sctx->job.blake2b_ntime, 8);
+			memcpy(&work->data[12], root, 32);
+			/* expose via v2_hdr so the scan path can reuse target logic */
+			work->is_v2 = true;
+			work->is_sia_blake2b = true;
 		} else {
 			work->data[17] = le32dec(sctx->job.ntime);
 			work->data[18] = le32dec(sctx->job.nbits);
@@ -2077,6 +2125,10 @@ static void *miner_thread(void *userdata)
 			nonce_oft = 32;
 			wkcmp_offset = 32 + 16;
 			wkcmp_sz = 32; // 35 * 4
+		} else if (opt_algo == ALGO_BLAKE2B && (work.is_sia_blake2b || g_work.is_sia_blake2b)) {
+			nonce_oft = 32;
+			wkcmp_offset = 12; /* bytes 48 (root) as word index */
+			wkcmp_sz = 32;
 		}
 
 		if (jsonrpc_2) {
@@ -2161,7 +2213,9 @@ static void *miner_thread(void *userdata)
 		// prevent scans before a job is received
 		// beware, some testnet (decred) are using version 0
 		// no version in sia draft protocol
-		if (opt_algo != ALGO_SIA && have_stratum && !work.data[0] && !opt_benchmark) {
+		if (opt_algo != ALGO_SIA &&
+		    !(opt_algo == ALGO_BLAKE2B && work.is_sia_blake2b) &&
+		    have_stratum && !work.data[0] && !opt_benchmark) {
 			sleep(1);
 			continue;
 		}
@@ -2318,7 +2372,9 @@ static void *miner_thread(void *userdata)
 			rc = scanhash_blakecoin(thr_id, &work, max_nonce, &hashes_done);
 			break;
 		case ALGO_BLAKE2B:
-			if (work.is_v2)
+			if (work.is_sia_blake2b)
+				rc = scanhash_blake2b_sia(thr_id, &work, max_nonce, &hashes_done);
+			else if (work.is_v2)
 				rc = scanhash_blake2b_v2(thr_id, &work, max_nonce, &hashes_done);
 			else
 				rc = scanhash_blake2b(thr_id, &work, max_nonce, &hashes_done);

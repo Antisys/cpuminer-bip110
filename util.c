@@ -1722,9 +1722,17 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	ntime = json_string_value(json_array_get(params, p++));
 	clean = json_is_true(json_array_get(params, p));
 
-	if (!job_id || !prevhash || !coinb1 || !coinb2 || !version || !nbits || !ntime ||
+	/* BIP-110 BLAKE2b Sia-style jobs (DATUM gateway):
+	 * params[2] = 39-byte commitment coinb1, coinb2 empty, merkle [],
+	 * ntime is 8 bytes. */
+	bool is_blake2b = (strcmp(algo, "blake2b") == 0 ||
+	                   strcmp(algo, "blake2b-v2") == 0) &&
+	                  ntime != NULL && strlen(ntime) == 16 &&
+	                  coinb1 != NULL && strlen(coinb1) == 78;
+
+	if (!job_id || !prevhash || !coinb1 || !version || !nbits || !ntime ||
 	    strlen(prevhash) != 64 || strlen(version) != 8 ||
-	    strlen(nbits) != 8 || strlen(ntime) != 8) {
+	    strlen(nbits) != 8 || (!is_blake2b && strlen(ntime) != 8)) {
 		applog(LOG_ERR, "Stratum notify: invalid parameters");
 		goto out;
 	}
@@ -1743,6 +1751,17 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	}
 
 	pthread_mutex_lock(&sctx->work_lock);
+
+	if (is_blake2b) {
+		/* Sia-style: coinb1 is the 39-byte commitment, coinb2 is empty.
+		 * Store it raw; the worker builds the 80-byte ASIC work header. */
+		sctx->job.blake2b = true;
+		sctx->job.blake2b_coinb1_size = 39;
+		hex2bin(sctx->job.blake2b_coinb1, coinb1, 39);
+		hex2bin(sctx->job.blake2b_ntime, ntime, 8);
+	} else {
+		sctx->job.blake2b = false;
+	}
 
 	coinb1_size = strlen(coinb1) / 2;
 	coinb2_size = strlen(coinb2) / 2;

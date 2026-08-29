@@ -456,6 +456,8 @@ int  bip110_create_header(const uint8_t *prevhash, const uint8_t *merkle_root,
                            uint32_t txcount, struct block_header_v2 *hdr);
 int  scanhash_blake2b_v2(int thr_id, struct work *work, uint32_t max_nonce,
                           uint64_t *hashes_done);
+int  scanhash_blake2b_sia(int thr_id, struct work *work, uint32_t max_nonce,
+                          uint64_t *hashes_done);
 
 struct work {
 	uint32_t data[48];
@@ -477,6 +479,8 @@ struct work {
 	// BIP-110 V2 header (set when version & 0x80000000)
 	int is_v2;
 	struct block_header_v2 v2_hdr;
+	// BIP-110 BLAKE2b Sia-style job (DATUM gateway header-v2 work)
+	int is_sia_blake2b;
 };
 
 struct stratum_job {
@@ -493,6 +497,11 @@ struct stratum_job {
 	unsigned char extra[64]; // like lbry claimtrie
 	bool clean;
 	double diff;
+	/* BIP-110 BLAKE2b Sia-style work (DATUM gateway) */
+	bool blake2b;
+	unsigned char blake2b_coinb1[64]; /* 39 bytes: 3x00 + h2 commitment + 4x00 */
+	size_t blake2b_coinb1_size;
+	unsigned char blake2b_ntime[8];   /* 8-byte ntime8 */
 };
 
 struct stratum_ctx {
