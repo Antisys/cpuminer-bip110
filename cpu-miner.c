@@ -1130,7 +1130,9 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 	bool rc = false;
 
 	/* pass if the previous hash is not the current previous hash */
-	if (opt_algo != ALGO_SIA && !submit_old && memcmp(&work->data[1], &g_work.data[1], 32)) {
+	if (opt_algo != ALGO_SIA &&
+	    !(opt_algo == ALGO_BLAKE2B && work->is_sia_blake2b) &&
+	    !submit_old && memcmp(&work->data[1], &g_work.data[1], 32)) {
 		if (opt_debug)
 			applog(LOG_DEBUG, "DEBUG: stale work detected, discarding");
 		return true;
@@ -1853,9 +1855,13 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 			uint8_t extranonce[12] = {0};
 			int en = (int)sctx->xnonce1_size;
 			if (en > 4) en = 4;
+			/* Gateway hasher extranonce[0:4] = sid_inv, which as LE bytes
+			 * equals the xnonce1 bytes directly (subscribe sends "%8.8x" sid). */
 			memcpy(extranonce, sctx->xnonce1, en);
 			memcpy(extranonce + 4, work->xnonce2, 8);
-			bip110_compute_prevblock_hidden(sctx->job.prevhash, prevblock_hidden);
+			/* DATUM gateway sends the already-computed BIP-110 prevblock_hidden
+			 * as the notify "prevhash" — use it directly, don't re-hash it. */
+			memcpy(prevblock_hidden, sctx->job.prevhash, 32);
 			{
 				uint8_t leaf[52];
 				memset(leaf, 0, sizeof(leaf));

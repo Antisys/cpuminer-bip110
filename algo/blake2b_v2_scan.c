@@ -48,7 +48,6 @@ static int v2_fulltest(const uint8_t *hash, const uint32_t *ptarget)
 int scanhash_blake2b_sia(int thr_id, struct work *work, uint32_t max_nonce,
                          uint64_t *hashes_done)
 {
-    uint32_t vhashcpu[8];
     uint8_t *pdata = (uint8_t*)work->data;
     uint32_t *ptarget = work->target;
 
@@ -69,10 +68,15 @@ int scanhash_blake2b_sia(int thr_id, struct work *work, uint32_t max_nonce,
         memcpy(pdata + 32, &nlo, 4);
         memcpy(pdata + 36, &nhi, 4);
 
-        blake2b_hash(vhashcpu, pdata);
+        uint8_t tmp_hash[32], hash_rev[32];
+        blake2b_hash(tmp_hash, pdata);
+        /* Gateway (datum_blake2b_pow_hash_le) reverses the digest:
+         * hash_le[31-i] = hash[i] ^ mask[i]. Replicate that order. */
+        for (int i = 0; i < 32; i++)
+            hash_rev[31 - i] = tmp_hash[i];
 
-        if (v2_fulltest((uint8_t*)vhashcpu, ptarget)) {
-            work_set_target_ratio(work, vhashcpu);
+        if (v2_fulltest(hash_rev, ptarget)) {
+            work_set_target_ratio(work, (uint32_t*)hash_rev);
             *hashes_done = n - start + 1;
             work->data[8] = nlo;
             work->data[9] = nhi;
