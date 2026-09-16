@@ -456,8 +456,6 @@ int  bip110_create_header(const uint8_t *prevhash, const uint8_t *merkle_root,
                            uint32_t txcount, struct block_header_v2 *hdr);
 int  scanhash_blake2b_v2(int thr_id, struct work *work, uint32_t max_nonce,
                           uint64_t *hashes_done);
-int  scanhash_blake2b_sia(int thr_id, struct work *work, uint32_t max_nonce,
-                          uint64_t *hashes_done);
 
 struct work {
 	uint32_t data[48];
@@ -476,11 +474,16 @@ struct work {
 	size_t xnonce2_len;
 	unsigned char *xnonce2;
 
-	// BIP-110 V2 header (set when version & 0x80000000)
+	// BIP-110 BLAKE2b V2-header work (DATUM gateway). is_v2/v2_hdr carry the
+	// nonce-independent fields (m_extranonce, and the fixed m_nonce2=0/
+	// m_nonce3=0/m_time_offset=0/m_flags=profile-1/m_xor_key=null we always
+	// use); blake2b_h2/blake2b_hash1 are precomputed once per job in
+	// stratum_gen_work (hash1 depends on h2+extranonce, both fixed for the
+	// job, so it doesn't need recomputing per nonce attempt).
 	int is_v2;
 	struct block_header_v2 v2_hdr;
-	// BIP-110 BLAKE2b Sia-style job (DATUM gateway header-v2 work)
-	int is_sia_blake2b;
+	uint8_t blake2b_h2[32];
+	uint8_t blake2b_hash1[32];
 };
 
 struct stratum_job {
@@ -497,16 +500,10 @@ struct stratum_job {
 	unsigned char extra[64]; // like lbry claimtrie
 	bool clean;
 	double diff;
-	/* BIP-110 BLAKE2b work (DATUM gateway). coinb1/ntime size vary by
-	 * chain state (coinbase size depends on the current headline text),
-	 * so both are stored with their actual received size rather than a
-	 * hardcoded legacy length - a fixed 39/8-byte assumption silently
-	 * truncated real coinbase data once the headline text changed. */
+	/* BIP-110 BLAKE2b V2-header work (DATUM gateway). h2 (32 bytes) is
+	 * carried in the "prevhash" field above (repurposed - see util.c's
+	 * stratum_notify) rather than a dedicated field. */
 	bool blake2b;
-	unsigned char blake2b_coinb1[256];
-	size_t blake2b_coinb1_size;
-	unsigned char blake2b_ntime[8];
-	size_t blake2b_ntime_size;
 };
 
 struct stratum_ctx {

@@ -1722,25 +1722,19 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	ntime = json_string_value(json_array_get(params, p++));
 	clean = json_is_true(json_array_get(params, p));
 
-	/* BIP-110 BLAKE2b Sia-style jobs (DATUM gateway):
-	 * params[2] = 39-byte commitment coinb1, coinb2 empty, merkle [],
-	 * ntime is 8 bytes. */
-	/* Detect our BIP-110 BLAKE2b DATUM jobs by algo name alone. The
-	 * original 16-hex-char ntime / 78-hex-char coinb1 length check was
-	 * fitted to one specific chain state (coinbase size depends on the
-	 * current headline text, which changes per RC); a longer headline
-	 * grows the coinbase and silently failed that check, misrouting
-	 * these jobs into the unrelated legacy Sia-coin scan path. Only
-	 * requirement now: coinb1 must fit our storage buffer. */
+	/* BIP-110 BLAKE2b V2-header jobs (DATUM gateway). This is our own
+	 * gateway and our own miner, so we don't need to match real Sv1 ASIC
+	 * wire conventions - only the underlying hash algorithm needs to match
+	 * consensus (verified against Knots' own test vectors on the gateway
+	 * side). We repurpose the standard "prevhash" wire field to carry h2
+	 * (32 bytes, already parsed generically into sctx->job.prevhash below -
+	 * no dedicated field needed); coinb1/coinb2/merkle are unused. */
 	bool is_blake2b = (strcmp(algo, "blake2b") == 0 ||
-	                   strcmp(algo, "blake2b-v2") == 0) &&
-	                  ntime != NULL && (strlen(ntime) == 8 || strlen(ntime) == 16) &&
-	                  coinb1 != NULL && strlen(coinb1) % 2 == 0 &&
-	                  strlen(coinb1) / 2 <= sizeof(((struct stratum_job*)0)->blake2b_coinb1);
+	                   strcmp(algo, "blake2b-v2") == 0);
 
 	if (!job_id || !prevhash || !coinb1 || !version || !nbits || !ntime ||
 	    strlen(prevhash) != 64 || strlen(version) != 8 ||
-	    strlen(nbits) != 8 || (!is_blake2b && strlen(ntime) != 8)) {
+	    strlen(nbits) != 8 || strlen(ntime) != 8) {
 		applog(LOG_ERR, "Stratum notify: invalid parameters");
 		goto out;
 	}
@@ -1760,21 +1754,9 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 
 	pthread_mutex_lock(&sctx->work_lock);
 
-	if (is_blake2b) {
-		/* coinb1 is the DATUM commitment; coinb2 is empty. Use the
-		 * actual received size, not a hardcoded legacy constant -
-		 * the worker builds the 80-byte ASIC work header from it. */
-		size_t coinb1_bytes = strlen(coinb1) / 2;
-		size_t ntime_bytes = strlen(ntime) / 2;
-		sctx->job.blake2b = true;
-		sctx->job.blake2b_coinb1_size = coinb1_bytes;
-		hex2bin(sctx->job.blake2b_coinb1, coinb1, coinb1_bytes);
-		memset(sctx->job.blake2b_ntime, 0, sizeof(sctx->job.blake2b_ntime));
-		hex2bin(sctx->job.blake2b_ntime, ntime, ntime_bytes);
-		sctx->job.blake2b_ntime_size = ntime_bytes;
-	} else {
-		sctx->job.blake2b = false;
-	}
+	/* h2 lives in sctx->job.prevhash (32 bytes), already filled by the
+	 * generic hex2bin(sctx->job.prevhash, prevhash, 32) call below. */
+	sctx->job.blake2b = is_blake2b;
 
 	coinb1_size = strlen(coinb1) / 2;
 	coinb2_size = strlen(coinb2) / 2;

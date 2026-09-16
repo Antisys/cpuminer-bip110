@@ -1,22 +1,16 @@
 /*
- * scanhash_blake2b_v2 - BIP-110 V2 header mining loop
+ * scanhash_blake2b_v2 - BIP-110 V2 header mining loop (DATUM gateway)
  *
- * Three-level nonce scan: nNonce (L1/ASIC) + m_nonce2 (L2) + m_nonce3 (L4)
- * Uses the three-stage BLAKE2b-256 hash from crypto/blake2b_v2.c
- *
- * Performance: h1, h2, hash1 (coinb1) and prevblock_hidden are all
- * nonce-independent and computed ONCE per job. The hot loop only runs the
- * ASIC-profile BLAKE2b-256 over the nonce-varying input.
+ * Uses the three-stage BLAKE2b-256 hash from crypto/blake2b_v2.c, fixed to
+ * ASIC profile 1 (no merge-mining, null XOR key) - see stratum_gen_work()
+ * in cpu-miner.c for how the job is built. h2 and hash1 are nonce-
+ * independent and precomputed once per job there; this loop only varies
+ * nNonce (m_nonce2/m_nonce3/m_time_offset are fixed at 0).
  */
 
 #include "miner.h"
 #include <string.h>
 #include <stdint.h>
-
-void blake2b_hash(void *output, const void *input);
-
-#define V2_NONCE3_STEP  1        // L4 nonce increment
-#define V2_NONCE3_MAX   0x100u   // 8-bit space (256 values)
 
 // Compare hash against target (both in LE uint32 arrays, 8 words = 256 bits)
 static int v2_fulltest(const uint8_t *hash, const uint32_t *ptarget)
@@ -34,131 +28,45 @@ static int v2_fulltest(const uint8_t *hash, const uint32_t *ptarget)
     return 1; // equal
 }
 
-/*
- * BIP-110 BLAKE2b Sia-style scan (DATUM gateway, header-v2 jobs).
- *
- * work->data holds an 80-byte work header:
- *   [0:32]  prevblock_hidden
- *   [32:40] nonce8  (nNonce + m_nonce2)  <- scanned here
- *   [40:48] ntime8  (time_offset + nonce3, from gateway)
- *   [48:80] root    (hash1 = blake2b(0x00||coinb1||extranonce))
- *
- * block_hash = blake2b(work80) XOR xor_mask  (xor_key is null -> mask = 0)
- */
-/* Per-thread nonce progress, kept OUTSIDE struct work.
- *
- * stratum_gen_work() unconditionally does memset(work->data, 0, 128) on
- * every job regeneration (new job/new block), which wipes data[8..9]
- * before this function ever sees it. On a chain with frequent job churn
- * (new block every 10-60s here), that reset every job means each thread
- * only ever rescans the same narrow slice near its range start and can
- * go forever without covering the rest of its range. Track progress here
- * instead, so it survives job regeneration; only reset on genuine
- * out-of-range (first run / thread count change).
- */
-static uint64_t g_sia_nonce[MAX_CPUS];
-static int g_sia_nonce_init[MAX_CPUS];
-
-int scanhash_blake2b_sia(int thr_id, struct work *work, uint32_t max_nonce,
-                         uint64_t *hashes_done)
-{
-    uint8_t *pdata = (uint8_t*)work->data;
-    uint32_t *ptarget = work->target;
-
-    /* Self-managed per-thread nonce range: [start, end). */
-    const uint64_t range = 0xffffffffULL / opt_n_threads;
-    const uint64_t start = range * thr_id;
-    const uint64_t end = (thr_id == opt_n_threads - 1)
-        ? 0xffffffffULL : range * (thr_id + 1) - 0x20;
-
-    uint64_t n = g_sia_nonce_init[thr_id] ? g_sia_nonce[thr_id] : start;
-    if (n < start || n >= end)
-        n = start;
-
-    do {
-        uint32_t nlo = (uint32_t)n;
-        uint32_t nhi = (uint32_t)(n >> 32);
-        memcpy(pdata + 32, &nlo, 4);
-        memcpy(pdata + 36, &nhi, 4);
-
-        uint8_t tmp_hash[32], hash_rev[32];
-        blake2b_hash(tmp_hash, pdata);
-        /* Gateway (datum_blake2b_pow_hash_le) reverses the digest:
-         * hash_le[31-i] = hash[i] ^ mask[i]. Replicate that order. */
-        for (int i = 0; i < 32; i++)
-            hash_rev[31 - i] = tmp_hash[i];
-
-        if (v2_fulltest(hash_rev, ptarget)) {
-            work_set_target_ratio(work, (uint32_t*)hash_rev);
-            *hashes_done = n - start + 1;
-            work->data[8] = nlo;
-            work->data[9] = nhi;
-            g_sia_nonce[thr_id] = n + 1;
-            g_sia_nonce_init[thr_id] = 1;
-            return 1;
-        }
-        n++;
-    } while (n < end && !work_restart[thr_id].restart);
-
-    *hashes_done = n - start + 1;
-    work->data[8] = (uint32_t)n;
-    work->data[9] = (uint32_t)(n >> 32);
-    g_sia_nonce[thr_id] = n;
-    g_sia_nonce_init[thr_id] = 1;
-    return 0;
-}
-
 int scanhash_blake2b_v2(int thr_id, struct work *work, uint32_t max_nonce,
                           uint64_t *hashes_done)
 {
     struct block_header_v2 *hdr = &work->v2_hdr;
     uint32_t *ptarget = work->target;
-    uint32_t start_nonce = hdr->nNonce;
+    uint32_t n = hdr->nNonce;
     uint64_t total_hashes = 0;
 
-    // Precompute all nonce-independent values once per job.
-    uint8_t h1_hash[32], h2_hash[32], hash1[32], prevblock_hidden[32];
-    bip110_compute_h1(hdr, h1_hash);
-    bip110_compute_h2(h1_hash, hdr->m_mm_rhs, h2_hash);
-    bip110_compute_hash1(h2_hash, hdr->m_extranonce, hash1);
-    bip110_compute_prevblock_hidden(hdr->hashPrevBlock, prevblock_hidden);
+    do {
+        hdr->nNonce = n;
 
-    // Scan: nonce3 outer, nonce2 middle, nonce1 inner
-    for (uint32_t n3 = hdr->m_nonce3; n3 < V2_NONCE3_MAX; n3 += V2_NONCE3_STEP) {
-        if (work_restart[thr_id].restart)
-            break;
+        uint8_t pow_hash_display[32], pow_hash[32];
+        /* prevblock_hidden is unused by ASIC profile 1 (see
+         * crypto/blake2b_v2.c) - pass a zero buffer. */
+        static const uint8_t zero32[32] = {0};
+        bip110_compute_pow_hash_pre(hdr, work->blake2b_h2, work->blake2b_hash1,
+                                    zero32, pow_hash_display);
+        /* bip110_compute_pow_hash_pre() returns "display order" (matching
+         * the JSON test-vector convention); compare_hashes()/v2_fulltest()
+         * expect "internal order" (byte[31] = MSB) - reverse before compare,
+         * same convention the gateway side uses. */
+        for (int i = 0; i < 32; i++)
+            pow_hash[31 - i] = pow_hash_display[i];
 
-        for (uint32_t n2 = hdr->m_nonce2; n2 != 0xFFFFFFFFu; n2++) {
-            if (work_restart[thr_id].restart)
-                break;
+        total_hashes++;
 
-            hdr->m_nonce3 = n3;
-            hdr->m_nonce2 = n2;
-
-            // Inner loop: L1/ASIC nonce
-            uint32_t n1 = hdr->nNonce;
-            while (n1 < max_nonce) {
-                hdr->nNonce = n1;
-
-                uint8_t pow_hash[32];
-                bip110_compute_pow_hash_pre(hdr, h2_hash, hash1,
-                                            prevblock_hidden, pow_hash);
-
-                total_hashes++;
-
-                if (v2_fulltest(pow_hash, ptarget)) {
-                    *hashes_done = total_hashes;
-                    return 1;
-                }
-
-                n1++;
-                if (work_restart[thr_id].restart)
-                    break;
-            }
-            hdr->nNonce = start_nonce; // reset for next n2
+        if (v2_fulltest(pow_hash, ptarget)) {
+            work_set_target_ratio(work, (uint32_t*)pow_hash);
+            *hashes_done = total_hashes;
+            work->data[19] = n;
+            hdr->nNonce = n;
+            return 1;
         }
-    }
+
+        n++;
+    } while (n < max_nonce && !work_restart[thr_id].restart);
 
     *hashes_done = total_hashes;
+    work->data[19] = n;
+    hdr->nNonce = n;
     return 0;
 }

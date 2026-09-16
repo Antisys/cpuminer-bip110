@@ -1129,9 +1129,11 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 	int i;
 	bool rc = false;
 
-	/* pass if the previous hash is not the current previous hash */
-	if (opt_algo != ALGO_SIA &&
-	    !(opt_algo == ALGO_BLAKE2B && work->is_sia_blake2b) &&
+	/* pass if the previous hash is not the current previous hash.
+	 * BLAKE2B V2-header work doesn't store a prevhash in work->data at
+	 * all (see stratum_gen_work) - this comparison is meaningless for it,
+	 * always bypass. */
+	if (opt_algo != ALGO_SIA && opt_algo != ALGO_BLAKE2B &&
 	    !submit_old && memcmp(&work->data[1], &g_work.data[1], 32)) {
 		if (opt_debug)
 			applog(LOG_DEBUG, "DEBUG: stale work detected, discarding");
@@ -1211,23 +1213,16 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 				xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
 			}
 
-			if (opt_algo == ALGO_BLAKE2B && work->is_sia_blake2b) {
-				/* BIP-110 Sia-style submit: [worker, job, extranonce2(8),
-				 * ntime8(8), nonce8(8)] */
-				char ntime8str[17], nonce8str[17];
-				bin2hex(ntime8str, (const unsigned char*)&work->data[10], 8);
-				bin2hex(nonce8str, (const unsigned char*)&work->data[8], 8);
-				xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
-				snprintf(s, JSON_BUF_LEN,
-						"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
-						rpc_user, work->job_id, xnonce2str, ntime8str, nonce8str);
-				free(xnonce2str);
-			} else {
+			/* BLAKE2B V2-header work also submits the standard 5-field
+			 * [worker, job, extranonce2, ntime, nonce] form - ntime is a
+			 * pass-through only (time is already committed into h1 on the
+			 * gateway at job-build time), and nonce is the 4-byte nNonce
+			 * the scan function found the share with, written into
+			 * work->data[19] at discovery time. */
 			snprintf(s, JSON_BUF_LEN,
 					"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
 					rpc_user, work->job_id, xnonce2str, ntimestr, noncestr);
 			free(xnonce2str);
-		}
 		}
 
 		// store to keep/display solved blocs (work struct not linked on accept notification)
@@ -1846,50 +1841,50 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 				work->data[12+i] = ((uint32_t*)merkle_root)[i];
 			//applog_hex(&work->data[0], 80);
 		} else if (opt_algo == ALGO_BLAKE2B && sctx->job.blake2b) {
-			/* BIP-110 BLAKE2b work (DATUM gateway).
-			 * work80 = prevblock_hidden(32) + nonce8(8) + ntime8(8) + root(32)
-			 * root   = blake2b(0x00 || coinb1(actual size) || extranonce(12))
-			 * hash   = blake2b(work80) XOR xor_mask
+			/* BIP-110 BLAKE2b V2-header work (DATUM gateway) - the real
+			 * consensus algorithm (TaggedHash h1/h2 + double BLAKE2b-256),
+			 * verified against Knots' own test vectors on the gateway side.
+			 * We always use ASIC profile 1, a null XOR key, and no
+			 * merge-mining - the simplest of the four valid profiles; see
+			 * the gateway's datum_stratum.h for the full rationale.
 			 *
-			 * coinb1 size varies with chain state (coinbase grows/shrinks
-			 * with the current headline text) - use the actual received
-			 * size, not a hardcoded constant, or real coinbase bytes get
-			 * silently truncated and the root hash is computed over the
-			 * wrong data (looks fine locally, never valid on the network).
+			 * h2 (32 bytes) is carried in the repurposed "prevhash" wire
+			 * field - this is our own gateway/miner pair, not a real ASIC,
+			 * so we don't need to match real Sv1 wire conventions, only the
+			 * underlying hash algorithm needs to match consensus. hash1 is
+			 * nonce-independent (depends only on h2+extranonce) and is
+			 * precomputed once per job here; the scan loop only needs to
+			 * vary nNonce per attempt.
 			 */
-			uint8_t prevblock_hidden[32], root[32];
-			uint8_t extranonce[12] = {0};
+			uint8_t extranonce[16] = {0};
 			int en = (int)sctx->xnonce1_size;
 			if (en > 4) en = 4;
 			/* Gateway hasher extranonce[0:4] = sid_inv, which as LE bytes
 			 * equals the xnonce1 bytes directly (subscribe sends "%8.8x" sid). */
 			memcpy(extranonce, sctx->xnonce1, en);
 			memcpy(extranonce + 4, work->xnonce2, 8);
-			/* DATUM gateway sends the already-computed BIP-110 prevblock_hidden
-			 * as the notify "prevhash" — use it directly, don't re-hash it. */
-			memcpy(prevblock_hidden, sctx->job.prevhash, 32);
-			{
-				size_t cb1_len = sctx->job.blake2b_coinb1_size;
-				uint8_t leaf[1 + sizeof(sctx->job.blake2b_coinb1) + 12];
-				size_t leaf_len = 1 + cb1_len + 12;
-				memset(leaf, 0, sizeof(leaf));
-				leaf[0] = 0;
-				memcpy(leaf + 1, sctx->job.blake2b_coinb1, cb1_len);
-				memcpy(leaf + 1 + cb1_len, extranonce, 12);
-				blake2b_ctx bctx;
-				blake2b_init(&bctx, 32, NULL, 0);
-				blake2b_update(&bctx, leaf, leaf_len);
-				blake2b_final(&bctx, root);
-			}
-			memcpy(work->data, prevblock_hidden, 32);
-			/* nonce8 (data[8..9]) left to the thread loop to manage;
-			 * stratum_gen_work must NOT reset it on regen, or all
-			 * threads re-scan the same range. */
-			memcpy(&work->data[10], sctx->job.blake2b_ntime, 8);
-			memcpy(&work->data[12], root, 32);
-			/* expose via v2_hdr so the scan path can reuse target logic */
+			/* extranonce[12:16] stay zero - m_extranonce is 16 bytes;
+			 * sid(4)+xnonce2(8)=12, zero-padded to fill the header field. */
+
+			memcpy(work->blake2b_h2, sctx->job.prevhash, 32);
+			bip110_compute_hash1(work->blake2b_h2, extranonce, work->blake2b_hash1);
+
+			memset(&work->v2_hdr, 0, sizeof(work->v2_hdr));
+			memcpy(work->v2_hdr.m_extranonce, extranonce, 16);
+			work->v2_hdr.m_flags = BIP110_ASIC_PROFILE_1;
+			/* m_nonce2/m_nonce3/m_time_offset/m_xor_key/nNonce all stay 0 -
+			 * nNonce is managed by the scan function's own persistent
+			 * per-thread state, not here (stratum_gen_work runs on every
+			 * job regen, which on a fast-block chain can be more often
+			 * than a share is found - the scan function must NOT lose
+			 * progress just because a fresh job came in). */
 			work->is_v2 = true;
-			work->is_sia_blake2b = true;
+			/* ntime isn't consumed by the hash (time is already committed
+			 * into h1 at job-build time on the gateway side); populate it
+			 * anyway so the standard 5-field mining.submit encode/parse
+			 * path below has something valid to send. Nonce (data[19]) is
+			 * left for the scan function to fill in on the winning attempt. */
+			work->data[17] = le32dec(sctx->job.ntime);
 		} else {
 			work->data[17] = le32dec(sctx->job.ntime);
 			work->data[18] = le32dec(sctx->job.nbits);
@@ -2030,6 +2025,15 @@ static bool wanna_mine(int thr_id)
 	return state;
 }
 
+/* BLAKE2B V2-header work doesn't store anything job-identifying in
+ * work->data (see stratum_gen_work) - compare the committed h2 hash
+ * instead, which changes on every job (it commits prevblock/merkle/
+ * time/height/nbits via the h1/h2 TaggedHash chain). */
+static int blake2b_job_changed(const struct work *a, const struct work *b)
+{
+	return memcmp(a->blake2b_h2, b->blake2b_h2, 32) != 0;
+}
+
 static void *miner_thread(void *userdata)
 {
 	struct thr_info *mythr = (struct thr_info *) userdata;
@@ -2139,10 +2143,8 @@ static void *miner_thread(void *userdata)
 			nonce_oft = 32;
 			wkcmp_offset = 32 + 16;
 			wkcmp_sz = 32; // 35 * 4
-		} else if (opt_algo == ALGO_BLAKE2B && (work.is_sia_blake2b || g_work.is_sia_blake2b)) {
-			nonce_oft = 32;
-			wkcmp_offset = 12; /* bytes 48 (root) as word index */
-			wkcmp_sz = 32;
+		} else if (opt_algo == ALGO_BLAKE2B) {
+			nonce_oft = 19 * sizeof(uint32_t); /* work.data[19], same as default */
 		}
 
 		if (jsonrpc_2) {
@@ -2164,7 +2166,7 @@ static void *miner_thread(void *userdata)
 
 			// to clean: is g_work loaded before the memcmp ?
 			regen_work = regen_work || ( (*nonceptr) >= end_nonce
-				&& !( memcmp(&work.data[wkcmp_offset], &g_work.data[wkcmp_offset], wkcmp_sz) ||
+				&& !( (opt_algo == ALGO_BLAKE2B ? blake2b_job_changed(&work, &g_work) : memcmp(&work.data[wkcmp_offset], &g_work.data[wkcmp_offset], wkcmp_sz)) ||
 				 jsonrpc_2 ? memcmp(((uint8_t*) work.data) + 43, ((uint8_t*) g_work.data) + 43, 33) : 0));
 			if (regen_work) {
 				stratum_gen_work(&stratum, &g_work);
@@ -2191,7 +2193,7 @@ static void *miner_thread(void *userdata)
 				continue;
 			}
 		}
-		if (memcmp(&work.data[wkcmp_offset], &g_work.data[wkcmp_offset], wkcmp_sz) ||
+		if ((opt_algo == ALGO_BLAKE2B ? blake2b_job_changed(&work, &g_work) : memcmp(&work.data[wkcmp_offset], &g_work.data[wkcmp_offset], wkcmp_sz)) ||
 			jsonrpc_2 ? memcmp(((uint8_t*) work.data) + 43, ((uint8_t*) g_work.data) + 43, 33) : 0)
 		{
 			work_free(&work);
@@ -2200,6 +2202,9 @@ static void *miner_thread(void *userdata)
 			*nonceptr = 0xffffffffU / opt_n_threads * thr_id;
 			if (opt_randomize)
 				nonceptr[0] += ((rand()*4) & UINT32_MAX) / opt_n_threads;
+			/* keep V2 header nonce in sync with the freshly-partitioned range */
+			if (work.is_v2 && opt_algo == ALGO_BLAKE2B)
+				work.v2_hdr.nNonce = *nonceptr;
 		} else {
 			++(*nonceptr);
 			/* keep V2 header nonce in sync with the rolling nonce pointer */
@@ -2227,8 +2232,7 @@ static void *miner_thread(void *userdata)
 		// prevent scans before a job is received
 		// beware, some testnet (decred) are using version 0
 		// no version in sia draft protocol
-		if (opt_algo != ALGO_SIA &&
-		    !(opt_algo == ALGO_BLAKE2B && work.is_sia_blake2b) &&
+		if (opt_algo != ALGO_SIA && opt_algo != ALGO_BLAKE2B &&
 		    have_stratum && !work.data[0] && !opt_benchmark) {
 			sleep(1);
 			continue;
@@ -2386,9 +2390,7 @@ static void *miner_thread(void *userdata)
 			rc = scanhash_blakecoin(thr_id, &work, max_nonce, &hashes_done);
 			break;
 		case ALGO_BLAKE2B:
-			if (work.is_sia_blake2b)
-				rc = scanhash_blake2b_sia(thr_id, &work, max_nonce, &hashes_done);
-			else if (work.is_v2)
+			if (work.is_v2)
 				rc = scanhash_blake2b_v2(thr_id, &work, max_nonce, &hashes_done);
 			else
 				rc = scanhash_blake2b(thr_id, &work, max_nonce, &hashes_done);
