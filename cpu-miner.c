@@ -1896,21 +1896,28 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		if (opt_showdiff || opt_max_diff > 0.)
 			calc_network_diff(work);
 
-		/* Detect BIP-110 V2 header (bit 31 of version) */
-		work->is_v2 = (work->data[0] & BIP110_VERSION_V2_FLAG) != 0;
-		if (work->is_v2 && opt_algo == ALGO_BLAKE2B) {
-			memset(&work->v2_hdr, 0, sizeof(work->v2_hdr));
-			work->v2_hdr.version = work->data[0];
-			for (i = 0; i < 8; i++)
-				memcpy(work->v2_hdr.hashPrevBlock + i * 4, &work->data[1 + i], 4);
-			for (i = 0; i < 8; i++)
-				memcpy(work->v2_hdr.hashMerkleRoot + i * 4, &work->data[9 + i], 4);
-			work->v2_hdr.time_on_wire = work->data[17];
-			work->v2_hdr.nBits = work->data[18];
-			work->v2_hdr.nNonce = work->data[19];
-			work->v2_hdr.m_height = sctx->bloc_height;
-			work->v2_hdr.m_flags = BIP110_ASIC_PROFILE_0 | BIP110_FLAG_USE_TIME_OFFSET;
-			applog(LOG_INFO, "BIP-110 V2 header detected, using three-stage BLAKE2b");
+		/* Detect BIP-110 V2 header (bit 31 of version) - legacy raw-getwork
+		 * path only. Our stratum-driven BLAKE2B job (sctx->job.blake2b,
+		 * handled above) already built v2_hdr/is_v2 itself from the wire
+		 * h2 field, not from work->data (which it never populates) - skip
+		 * this block there, or it clobbers is_v2 back to false (work->data[0]
+		 * is 0) and misroutes the scan dispatch to the wrong function. */
+		if (!(opt_algo == ALGO_BLAKE2B && sctx->job.blake2b)) {
+			work->is_v2 = (work->data[0] & BIP110_VERSION_V2_FLAG) != 0;
+			if (work->is_v2 && opt_algo == ALGO_BLAKE2B) {
+				memset(&work->v2_hdr, 0, sizeof(work->v2_hdr));
+				work->v2_hdr.version = work->data[0];
+				for (i = 0; i < 8; i++)
+					memcpy(work->v2_hdr.hashPrevBlock + i * 4, &work->data[1 + i], 4);
+				for (i = 0; i < 8; i++)
+					memcpy(work->v2_hdr.hashMerkleRoot + i * 4, &work->data[9 + i], 4);
+				work->v2_hdr.time_on_wire = work->data[17];
+				work->v2_hdr.nBits = work->data[18];
+				work->v2_hdr.nNonce = work->data[19];
+				work->v2_hdr.m_height = sctx->bloc_height;
+				work->v2_hdr.m_flags = BIP110_ASIC_PROFILE_0 | BIP110_FLAG_USE_TIME_OFFSET;
+				applog(LOG_INFO, "BIP-110 V2 header detected, using three-stage BLAKE2b");
+			}
 		}
 
 		if (opt_algo == ALGO_DROP || opt_algo == ALGO_NEOSCRYPT || opt_algo == ALGO_ZR5) {
