@@ -497,11 +497,16 @@ struct stratum_job {
 	unsigned char extra[64]; // like lbry claimtrie
 	bool clean;
 	double diff;
-	/* BIP-110 BLAKE2b Sia-style work (DATUM gateway) */
+	/* BIP-110 BLAKE2b work (DATUM gateway). coinb1/ntime size vary by
+	 * chain state (coinbase size depends on the current headline text),
+	 * so both are stored with their actual received size rather than a
+	 * hardcoded legacy length - a fixed 39/8-byte assumption silently
+	 * truncated real coinbase data once the headline text changed. */
 	bool blake2b;
-	unsigned char blake2b_coinb1[64]; /* 39 bytes: 3x00 + h2 commitment + 4x00 */
+	unsigned char blake2b_coinb1[256];
 	size_t blake2b_coinb1_size;
-	unsigned char blake2b_ntime[8];   /* 8-byte ntime8 */
+	unsigned char blake2b_ntime[8];
+	size_t blake2b_ntime_size;
 };
 
 struct stratum_ctx {

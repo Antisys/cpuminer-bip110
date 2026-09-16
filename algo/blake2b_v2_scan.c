@@ -45,20 +45,33 @@ static int v2_fulltest(const uint8_t *hash, const uint32_t *ptarget)
  *
  * block_hash = blake2b(work80) XOR xor_mask  (xor_key is null -> mask = 0)
  */
+/* Per-thread nonce progress, kept OUTSIDE struct work.
+ *
+ * stratum_gen_work() unconditionally does memset(work->data, 0, 128) on
+ * every job regeneration (new job/new block), which wipes data[8..9]
+ * before this function ever sees it. On a chain with frequent job churn
+ * (new block every 10-60s here), that reset every job means each thread
+ * only ever rescans the same narrow slice near its range start and can
+ * go forever without covering the rest of its range. Track progress here
+ * instead, so it survives job regeneration; only reset on genuine
+ * out-of-range (first run / thread count change).
+ */
+static uint64_t g_sia_nonce[MAX_CPUS];
+static int g_sia_nonce_init[MAX_CPUS];
+
 int scanhash_blake2b_sia(int thr_id, struct work *work, uint32_t max_nonce,
                          uint64_t *hashes_done)
 {
     uint8_t *pdata = (uint8_t*)work->data;
     uint32_t *ptarget = work->target;
 
-    /* Self-managed per-thread nonce range: [start, end).
-     * data[8..9] carries the rolling nonce; re-init at range start. */
+    /* Self-managed per-thread nonce range: [start, end). */
     const uint64_t range = 0xffffffffULL / opt_n_threads;
     const uint64_t start = range * thr_id;
     const uint64_t end = (thr_id == opt_n_threads - 1)
         ? 0xffffffffULL : range * (thr_id + 1) - 0x20;
 
-    uint64_t n = (uint64_t)work->data[8] | ((uint64_t)work->data[9] << 32);
+    uint64_t n = g_sia_nonce_init[thr_id] ? g_sia_nonce[thr_id] : start;
     if (n < start || n >= end)
         n = start;
 
@@ -80,6 +93,8 @@ int scanhash_blake2b_sia(int thr_id, struct work *work, uint32_t max_nonce,
             *hashes_done = n - start + 1;
             work->data[8] = nlo;
             work->data[9] = nhi;
+            g_sia_nonce[thr_id] = n + 1;
+            g_sia_nonce_init[thr_id] = 1;
             return 1;
         }
         n++;
@@ -88,6 +103,8 @@ int scanhash_blake2b_sia(int thr_id, struct work *work, uint32_t max_nonce,
     *hashes_done = n - start + 1;
     work->data[8] = (uint32_t)n;
     work->data[9] = (uint32_t)(n >> 32);
+    g_sia_nonce[thr_id] = n;
+    g_sia_nonce_init[thr_id] = 1;
     return 0;
 }
 

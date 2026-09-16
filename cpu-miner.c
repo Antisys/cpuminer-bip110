@@ -1846,10 +1846,16 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 				work->data[12+i] = ((uint32_t*)merkle_root)[i];
 			//applog_hex(&work->data[0], 80);
 		} else if (opt_algo == ALGO_BLAKE2B && sctx->job.blake2b) {
-			/* BIP-110 BLAKE2b Sia-style work (DATUM gateway).
+			/* BIP-110 BLAKE2b work (DATUM gateway).
 			 * work80 = prevblock_hidden(32) + nonce8(8) + ntime8(8) + root(32)
-			 * root   = blake2b(0x00 || coinb1(39) || extranonce(12))
+			 * root   = blake2b(0x00 || coinb1(actual size) || extranonce(12))
 			 * hash   = blake2b(work80) XOR xor_mask
+			 *
+			 * coinb1 size varies with chain state (coinbase grows/shrinks
+			 * with the current headline text) - use the actual received
+			 * size, not a hardcoded constant, or real coinbase bytes get
+			 * silently truncated and the root hash is computed over the
+			 * wrong data (looks fine locally, never valid on the network).
 			 */
 			uint8_t prevblock_hidden[32], root[32];
 			uint8_t extranonce[12] = {0};
@@ -1863,14 +1869,16 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 			 * as the notify "prevhash" — use it directly, don't re-hash it. */
 			memcpy(prevblock_hidden, sctx->job.prevhash, 32);
 			{
-				uint8_t leaf[52];
+				size_t cb1_len = sctx->job.blake2b_coinb1_size;
+				uint8_t leaf[1 + sizeof(sctx->job.blake2b_coinb1) + 12];
+				size_t leaf_len = 1 + cb1_len + 12;
 				memset(leaf, 0, sizeof(leaf));
 				leaf[0] = 0;
-				memcpy(leaf + 1, sctx->job.blake2b_coinb1, 39);
-				memcpy(leaf + 40, extranonce, 12);
+				memcpy(leaf + 1, sctx->job.blake2b_coinb1, cb1_len);
+				memcpy(leaf + 1 + cb1_len, extranonce, 12);
 				blake2b_ctx bctx;
 				blake2b_init(&bctx, 32, NULL, 0);
-				blake2b_update(&bctx, leaf, sizeof(leaf));
+				blake2b_update(&bctx, leaf, leaf_len);
 				blake2b_final(&bctx, root);
 			}
 			memcpy(work->data, prevblock_hidden, 32);

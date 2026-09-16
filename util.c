@@ -1725,10 +1725,18 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	/* BIP-110 BLAKE2b Sia-style jobs (DATUM gateway):
 	 * params[2] = 39-byte commitment coinb1, coinb2 empty, merkle [],
 	 * ntime is 8 bytes. */
+	/* Detect our BIP-110 BLAKE2b DATUM jobs by algo name alone. The
+	 * original 16-hex-char ntime / 78-hex-char coinb1 length check was
+	 * fitted to one specific chain state (coinbase size depends on the
+	 * current headline text, which changes per RC); a longer headline
+	 * grows the coinbase and silently failed that check, misrouting
+	 * these jobs into the unrelated legacy Sia-coin scan path. Only
+	 * requirement now: coinb1 must fit our storage buffer. */
 	bool is_blake2b = (strcmp(algo, "blake2b") == 0 ||
 	                   strcmp(algo, "blake2b-v2") == 0) &&
-	                  ntime != NULL && strlen(ntime) == 16 &&
-	                  coinb1 != NULL && strlen(coinb1) == 78;
+	                  ntime != NULL && (strlen(ntime) == 8 || strlen(ntime) == 16) &&
+	                  coinb1 != NULL && strlen(coinb1) % 2 == 0 &&
+	                  strlen(coinb1) / 2 <= sizeof(((struct stratum_job*)0)->blake2b_coinb1);
 
 	if (!job_id || !prevhash || !coinb1 || !version || !nbits || !ntime ||
 	    strlen(prevhash) != 64 || strlen(version) != 8 ||
@@ -1753,12 +1761,17 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	pthread_mutex_lock(&sctx->work_lock);
 
 	if (is_blake2b) {
-		/* Sia-style: coinb1 is the 39-byte commitment, coinb2 is empty.
-		 * Store it raw; the worker builds the 80-byte ASIC work header. */
+		/* coinb1 is the DATUM commitment; coinb2 is empty. Use the
+		 * actual received size, not a hardcoded legacy constant -
+		 * the worker builds the 80-byte ASIC work header from it. */
+		size_t coinb1_bytes = strlen(coinb1) / 2;
+		size_t ntime_bytes = strlen(ntime) / 2;
 		sctx->job.blake2b = true;
-		sctx->job.blake2b_coinb1_size = 39;
-		hex2bin(sctx->job.blake2b_coinb1, coinb1, 39);
-		hex2bin(sctx->job.blake2b_ntime, ntime, 8);
+		sctx->job.blake2b_coinb1_size = coinb1_bytes;
+		hex2bin(sctx->job.blake2b_coinb1, coinb1, coinb1_bytes);
+		memset(sctx->job.blake2b_ntime, 0, sizeof(sctx->job.blake2b_ntime));
+		hex2bin(sctx->job.blake2b_ntime, ntime, ntime_bytes);
+		sctx->job.blake2b_ntime_size = ntime_bytes;
 	} else {
 		sctx->job.blake2b = false;
 	}
